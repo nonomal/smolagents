@@ -231,7 +231,6 @@ def get_clean_message_list(
                 output_message_list[-1]["content"] += message["content"]
         else:
             if flatten_messages_as_text:
-                print("OOO", message)
                 content = message["content"][0]["text"]
             else:
                 content = message["content"]
