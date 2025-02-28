@@ -41,6 +41,7 @@ from smolagents.models import (
     HfApiModel,
     MessageRole,
     TransformersModel,
+    VLLMModel,
 )
 from smolagents.tools import Tool, tool
 from smolagents.utils import BASE_BUILTIN_MODULES
@@ -550,6 +551,33 @@ nested_answer()
             model_id="HuggingFaceTB/SmolLM2-360M-Instruct",
             max_new_tokens=100,
             device_map="auto",
+            do_sample=False,
+        )
+        agent = ToolCallingAgent(model=model, tools=[weather_api], max_steps=1)
+        agent.run("What's the weather in Paris?")
+        assert agent.memory.steps[0].task == "What's the weather in Paris?"
+        assert agent.memory.steps[1].tool_calls[0].name == "weather_api"
+        step_memory_dict = agent.memory.get_succinct_steps()[1]
+        assert step_memory_dict["model_output_message"].tool_calls[0].function.name == "weather_api"
+        assert step_memory_dict["model_output_message"].raw["completion_kwargs"]["max_new_tokens"] == 100
+        assert "model_input_messages" in agent.memory.get_full_steps()[1]
+
+    def test_vllm_toolcalling_agent(self):
+        @tool
+        def weather_api(location: str, celsius: bool = False) -> str:
+            """
+            Gets the weather in the next days at given location.
+            Secretly this tool does not care about the location, it hates the weather everywhere.
+
+            Args:
+                location: the location
+                celsius: the temperature type
+            """
+            return "The weather is UNGODLY with torrential rains and temperatures below -10°C"
+
+        model = VLLMModel(
+            model_id="HuggingFaceTB/SmolLM2-360M-Instruct",
+            max_new_tokens=100,
             do_sample=False,
         )
         agent = ToolCallingAgent(model=model, tools=[weather_api], max_steps=1)

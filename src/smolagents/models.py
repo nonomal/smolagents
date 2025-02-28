@@ -231,11 +231,29 @@ def get_clean_message_list(
                 output_message_list[-1]["content"] += message["content"]
         else:
             if flatten_messages_as_text:
+                print("OOO", message)
                 content = message["content"][0]["text"]
             else:
                 content = message["content"]
             output_message_list.append({"role": message["role"], "content": content})
     return output_message_list
+
+
+def get_tool_call_chat_message_from_text(text: str, tool_name_key: str, tool_arguments_key: str) -> ChatMessage:
+    tool_call_dictionary, text = parse_json_blob(text)
+    tool_name = tool_call_dictionary.get(tool_name_key, None)
+    tool_arguments = tool_call_dictionary.get(tool_arguments_key, None)
+    return ChatMessage(
+        role="assistant",
+        content=text,
+        tool_calls=[
+            ChatMessageToolCall(
+                id=uuid.uuid4(),
+                type="function",
+                function=ChatMessageToolCallDefinition(name=tool_name, arguments=tool_arguments),
+            )
+        ],
+    )
 
 
 class Model:
@@ -490,6 +508,7 @@ class VLLMModel(Model):
         self.model_id = model_id
         self.model = LLM(model=model_id)
         self.tokenizer = get_tokenizer(model_id)
+        self._is_vlm = False  # VLLMModel does not support vision models yet.
 
     def cleanup(self):
         import gc
@@ -516,11 +535,23 @@ class VLLMModel(Model):
     ) -> ChatMessage:
         from vllm import SamplingParams
 
-        messages = get_clean_message_list(messages, role_conversions=tool_role_conversions)
+        completion_kwargs = self._prepare_completion_kwargs(
+            messages=messages,
+            flatten_messages_as_text=(not self._is_vlm),
+            stop_sequences=stop_sequences,
+            grammar=grammar,
+            tools_to_call_from=tools_to_call_from,
+            **kwargs,
+        )
+        messages = completion_kwargs.pop("messages")
+        prepared_stop_sequences = completion_kwargs.pop("stop", [])
+        tools = completion_kwargs.pop("tools", None)
+        completion_kwargs.pop("tool_choice", None)
+
         if tools_to_call_from is not None:
             prompt = self.tokenizer.apply_chat_template(
                 messages,
-                tools=[get_tool_json_schema(tool) for tool in tools_to_call_from],
+                tools=tools,
                 add_generation_prompt=True,
                 tokenize=False,
             )
@@ -534,7 +565,7 @@ class VLLMModel(Model):
             n=kwargs.get("n", 1),
             temperature=kwargs.get("temperature", 0.0),
             max_tokens=kwargs.get("max_tokens", 2048),
-            stop=stop_sequences,
+            stop=prepared_stop_sequences,
         )
 
         out = self.model.generate(
@@ -545,26 +576,13 @@ class VLLMModel(Model):
         self.last_input_token_count = len(out[0].prompt_token_ids)
         self.last_output_token_count = len(out[0].outputs[0].token_ids)
         if tools_to_call_from:
-            return get_tool_call_chat_message_from_text(output, self.tool_name_key, self.tool_arguments_key)
+            chat_message = get_tool_call_chat_message_from_text(output, self.tool_name_key, self.tool_arguments_key)
+            chat_message.raw = {"out": out, "completion_kwargs": completion_kwargs}
+            return chat_message
         else:
-            return ChatMessage(role="assistant", content=output, raw={"out": out, "completion_kwargs": kwargs})
-
-
-def get_tool_call_chat_message_from_text(text: str, tool_name_key: str, tool_arguments_key: str) -> ChatMessage:
-    tool_call_dictionary, text = parse_json_blob(text)
-    tool_name = tool_call_dictionary.get(tool_name_key, None)
-    tool_arguments = tool_call_dictionary.get(tool_arguments_key, None)
-    return ChatMessage(
-        role="assistant",
-        content=text,
-        tool_calls=[
-            ChatMessageToolCall(
-                id=uuid.uuid4(),
-                type="function",
-                function=ChatMessageToolCallDefinition(name=tool_name, arguments=tool_arguments),
+            return ChatMessage(
+                role="assistant", content=output, raw={"out": out, "completion_kwargs": completion_kwargs}
             )
-        ],
-    )
 
 
 class MLXModel(Model):
@@ -625,6 +643,7 @@ class MLXModel(Model):
         self.stream_generate = mlx_lm.stream_generate
         self.tool_name_key = tool_name_key
         self.tool_arguments_key = tool_arguments_key
+        self.is_vlm = False  # mlx-lm doesn't support vision models
 
     def __call__(
         self,
@@ -635,7 +654,7 @@ class MLXModel(Model):
         **kwargs,
     ) -> ChatMessage:
         completion_kwargs = self._prepare_completion_kwargs(
-            flatten_messages_as_text=True,  # mlx-lm doesn't support vision models
+            flatten_messages_as_text=(not self._is_vlm),
             messages=messages,
             stop_sequences=stop_sequences,
             grammar=grammar,
@@ -670,7 +689,9 @@ class MLXModel(Model):
                 break
 
         if tools_to_call_from:
-            return get_tool_call_chat_message_from_text(text, self.tool_name_key, self.tool_arguments_key)
+            chat_message = get_tool_call_chat_message_from_text(text, self.tool_name_key, self.tool_arguments_key)
+            chat_message.raw = {"out": text, "completion_kwargs": completion_kwargs}
+            return chat_message
         else:
             return ChatMessage(
                 role="assistant", content=text, raw={"out": text, "completion_kwargs": completion_kwargs}
@@ -872,7 +893,9 @@ class TransformersModel(Model):
             output = remove_stop_sequences(output, stop_sequences)
 
         if tools_to_call_from:
-            return get_tool_call_chat_message_from_text(output, self.tool_name_key, self.tool_arguments_key)
+            chat_message = get_tool_call_chat_message_from_text(output, self.tool_name_key, self.tool_arguments_key)
+            chat_message.raw = {"out": out, "completion_kwargs": completion_kwargs}
+            return chat_message
         else:
             return ChatMessage(
                 role="assistant",
