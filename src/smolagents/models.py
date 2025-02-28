@@ -17,7 +17,6 @@
 import json
 import logging
 import os
-import random
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -103,7 +102,6 @@ class ChatMessage:
         if getattr(message, "tool_calls", None) is not None:
             tool_calls = [ChatMessageToolCall.from_hf_api(tool_call) for tool_call in message.tool_calls]
         return cls(role=message.role, content=message.content, tool_calls=tool_calls, raw=raw)
-
 
     @classmethod
     def from_dict(cls, data: dict) -> "ChatMessage":
@@ -628,7 +626,6 @@ class MLXModel(Model):
         self.tool_name_key = tool_name_key
         self.tool_arguments_key = tool_arguments_key
 
-
     def __call__(
         self,
         messages: List[Dict[str, str]],
@@ -675,7 +672,9 @@ class MLXModel(Model):
         if tools_to_call_from:
             return get_tool_call_chat_message_from_text(text, self.tool_name_key, self.tool_arguments_key)
         else:
-            return ChatMessage(role="assistant", content=text, raw={"out": text, "completion_kwargs": completion_kwargs})
+            return ChatMessage(
+                role="assistant", content=text, raw={"out": text, "completion_kwargs": completion_kwargs}
+            )
 
 
 class TransformersModel(Model):
