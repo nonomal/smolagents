@@ -546,24 +546,27 @@ class VLLMModel(Model):
         output = out[0].outputs[0].text
         self.last_input_token_count = len(out[0].prompt_token_ids)
         self.last_output_token_count = len(out[0].outputs[0].token_ids)
-        if tools_to_call_from is None:
-            return ChatMessage(role="assistant", content=output)
+        if tools_to_call_from:
+            return get_tool_call_chat_message_from_text(output, self.tool_name_key, self.tool_arguments_key)
         else:
-            parsed_output = json.loads(output)
-            return ChatMessage(
-                role="assistant",
-                content="",
-                tool_calls=[
-                    ChatMessageToolCall(
-                        id="".join(random.choices("0123456789", k=5)),
-                        type="function",
-                        function=ChatMessageToolCallDefinition(
-                            name=parsed_output.get(self.tool_name_key, None),
-                            arguments=parsed_output.get(self.tool_arguments_key, None)
-                        ),
-                    )
-                ],
+            return ChatMessage(role="assistant", content=output, raw={"out": out, "completion_kwargs": kwargs})
+
+
+def get_tool_call_chat_message_from_text(text: str, tool_name_key: str, tool_arguments_key: str) -> ChatMessage:
+    tool_call_dictionary, text = parse_json_blob(text)
+    tool_name = tool_call_dictionary.get(tool_name_key, None)
+    tool_arguments = tool_call_dictionary.get(tool_arguments_key, None)
+    return ChatMessage(
+        role="assistant",
+        content=text,
+        tool_calls=[
+            ChatMessageToolCall(
+                id=uuid.uuid4(),
+                type="function",
+                function=ChatMessageToolCallDefinition(name=tool_name, arguments=tool_arguments),
             )
+        ],
+    )
 
 
 class MLXModel(Model):
@@ -670,23 +673,9 @@ class MLXModel(Model):
                 break
 
         if tools_to_call_from:
-            # Extracts tool JSON without assuming a specific model output format
-            parsed_text = parse_json_blob(text)
-            tool_name = parsed_text.get(self.tool_name_key, None)
-            tool_arguments = parsed_text.get(self.tool_arguments_key, None)
-            if tool_name:
-                return ChatMessage(
-                    role="assistant",
-                    content="",
-                    tool_calls=[
-                        ChatMessageToolCall(
-                            id=uuid.uuid4(),
-                            type="function",
-                            function=ChatMessageToolCallDefinition(name=tool_name, arguments=tool_arguments),
-                        )
-                    ],
-                )
-        return ChatMessage(role="assistant", content=text)
+            return get_tool_call_chat_message_from_text(text, self.tool_name_key, self.tool_arguments_key)
+        else:
+            return ChatMessage(role="assistant", content=text, raw={"out": text, "completion_kwargs": completion_kwargs})
 
 
 class TransformersModel(Model):
@@ -883,38 +872,12 @@ class TransformersModel(Model):
         if stop_sequences is not None:
             output = remove_stop_sequences(output, stop_sequences)
 
-        if tools_to_call_from is None:
+        if tools_to_call_from:
+            return get_tool_call_chat_message_from_text(output, self.tool_name_key, self.tool_arguments_key)
+        else:
             return ChatMessage(
                 role="assistant",
                 content=output,
-                raw={"out": out, "completion_kwargs": completion_kwargs},
-            )
-        else:
-            if "Action:" in output:
-                output = output.split("Action:", 1)[1].strip()
-            try:
-                start_index = output.index("{")
-                end_index = output.rindex("}")
-                output = output[start_index : end_index + 1]
-            except Exception as e:
-                raise Exception("No json blob found in output!") from e
-
-            try:
-                parsed_output = json.loads(output)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Tool call '{output}' has an invalid JSON structure: {e}")
-            tool_name = parsed_output.get("name")
-            tool_arguments = parsed_output.get("arguments")
-            return ChatMessage(
-                role="assistant",
-                content="",
-                tool_calls=[
-                    ChatMessageToolCall(
-                        id="".join(random.choices("0123456789", k=5)),
-                        type="function",
-                        function=ChatMessageToolCallDefinition(name=tool_name, arguments=tool_arguments),
-                    )
-                ],
                 raw={"out": out, "completion_kwargs": completion_kwargs},
             )
 
