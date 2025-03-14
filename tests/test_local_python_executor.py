@@ -24,10 +24,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from smolagents.default_tools import BASE_PYTHON_TOOLS
+from smolagents.default_tools import BASE_PYTHON_TOOLS, FinalAnswerTool
 from smolagents.local_python_executor import (
     DANGEROUS_FUNCTIONS,
-    DANGEROUS_MODULES,
     InterpreterError,
     LocalPythonExecutor,
     PrintContainer,
@@ -39,6 +38,21 @@ from smolagents.local_python_executor import (
     fix_final_answer_code,
     get_safe_module,
 )
+
+
+# Non-exhaustive list of dangerous modules that should not be imported
+DANGEROUS_MODULES = [
+    "builtins",
+    "io",
+    "multiprocessing",
+    "os",
+    "pathlib",
+    "pty",
+    "shutil",
+    "socket",
+    "subprocess",
+    "sys",
+]
 
 
 # Fake function we will use as tool
@@ -283,9 +297,12 @@ recur_fibo(6)"""
         assert result == "le"
 
     def test_access_attributes(self):
-        code = "integer = 1\nobj_class = integer.__class__\nobj_class"
-        result, _ = evaluate_python_code(code, {}, state={})
-        assert result is int
+        class A:
+            attr = 2
+
+        code = "A.attr"
+        result, _ = evaluate_python_code(code, {}, state={"A": A})
+        assert result == 2
 
     def test_list_comprehension(self):
         code = "sentence = 'THESEAGULL43'\nmeaningful_sentence = '-'.join([char.lower() for char in sentence if char.isalpha()])"
@@ -504,10 +521,10 @@ if char.isalpha():
 
         # Test submodules are handled properly, thus not raising error
         code = "import numpy.random as rd\nrng = rd.default_rng(12345)\nrng.random()"
-        result, _ = evaluate_python_code(code, BASE_PYTHON_TOOLS, state={}, authorized_imports=["numpy"])
+        result, _ = evaluate_python_code(code, BASE_PYTHON_TOOLS, state={}, authorized_imports=["numpy.random"])
 
         code = "from numpy.random import default_rng as d_rng\nrng = d_rng(12345)\nrng.random()"
-        result, _ = evaluate_python_code(code, BASE_PYTHON_TOOLS, state={}, authorized_imports=["numpy"])
+        result, _ = evaluate_python_code(code, BASE_PYTHON_TOOLS, state={}, authorized_imports=["numpy.random"])
 
     def test_additional_imports(self):
         code = "import numpy as np"
@@ -1046,6 +1063,24 @@ exec(compile('{unsafe_code}', 'no filename', 'exec'))
     def test_can_import_sklearn_if_explicitly_authorized(self):
         code = "import sklearn"
         evaluate_python_code(code, authorized_imports=["sklearn"])
+
+    def test_function_def_recovers_source_code(self):
+        executor = LocalPythonExecutor([])
+
+        executor.send_tools({"final_answer": FinalAnswerTool()})
+
+        res, _, _ = executor(
+            dedent(
+                """
+                def target_function():
+                    return "Hello world"
+
+                final_answer(target_function)
+                """
+            )
+        )
+        assert res.__name__ == "target_function"
+        assert res.__source__ == "def target_function():\n    return 'Hello world'"
 
 
 @pytest.mark.parametrize(
@@ -1704,7 +1739,11 @@ class TestLocalPythonExecutorSecurity:
         # Skip test if module is not installed: posix module is not installed on Windows
         pytest.importorskip(dangerous_module_name)
         executor = LocalPythonExecutor([dangerous_module_name])
-        with pytest.raises(InterpreterError, match=f".*Forbidden access to function: {dangerous_function_name}"):
+        if "__" in dangerous_function_name:
+            error_match = f".*Forbidden access to dunder attribute: {dangerous_function_name}"
+        else:
+            error_match = f".*Forbidden access to function: {dangerous_function_name}.*"
+        with pytest.raises(InterpreterError, match=error_match):
             executor(f"import {dangerous_module_name}; {dangerous_function}")
 
     @pytest.mark.parametrize(
@@ -1773,32 +1812,61 @@ class TestLocalPythonExecutorSecurity:
         "code, additional_authorized_imports, expected_error",
         [
             # os submodule
-            ("import queue; queue.threading._os.system(':')", [], InterpreterError("Forbidden access to module: os")),
+            (
+                "import queue; queue.threading._os.system(':')",
+                [],
+                InterpreterError("Forbidden access to module: threading"),
+            ),
+            (
+                "import queue; queue.threading._os.system(':')",
+                ["threading"],
+                InterpreterError("Forbidden access to module: os"),
+            ),
             ("import random; random._os.system(':')", [], InterpreterError("Forbidden access to module: os")),
             (
                 "import random; random.__dict__['_os'].system(':')",
                 [],
-                InterpreterError("Forbidden access to module: os"),
+                InterpreterError("Forbidden access to dunder attribute: __dict__"),
             ),
             (
                 "import doctest; doctest.inspect.os.system(':')",
                 ["doctest"],
+                InterpreterError("Forbidden access to module: inspect"),
+            ),
+            (
+                "import doctest; doctest.inspect.os.system(':')",
+                ["doctest", "inspect"],
                 InterpreterError("Forbidden access to module: os"),
             ),
             # subprocess submodule
             (
                 "import asyncio; asyncio.base_events.events.subprocess",
                 ["asyncio"],
+                InterpreterError("Forbidden access to module: asyncio.base_events"),
+            ),
+            (
+                "import asyncio; asyncio.base_events.events.subprocess",
+                ["asyncio", "asyncio.base_events"],
+                InterpreterError("Forbidden access to module: asyncio.events"),
+            ),
+            (
+                "import asyncio; asyncio.base_events.events.subprocess",
+                ["asyncio", "asyncio.base_events", "asyncio.events"],
                 InterpreterError("Forbidden access to module: subprocess"),
             ),
             # sys submodule
             (
                 "import queue; queue.threading._sys.modules['os'].system(':')",
                 [],
+                InterpreterError("Forbidden access to module: threading"),
+            ),
+            (
+                "import queue; queue.threading._sys.modules['os'].system(':')",
+                ["threading"],
                 InterpreterError("Forbidden access to module: sys"),
             ),
             # Allowed
-            ("import pandas; pandas.io", ["pandas"], None),
+            ("import pandas; pandas.io", ["pandas", "pandas.io"], None),
         ],
     )
     def test_vulnerability_via_submodules(self, code, additional_authorized_imports, expected_error):
@@ -1851,8 +1919,12 @@ class TestLocalPythonExecutorSecurity:
     @pytest.mark.parametrize(
         "additional_authorized_imports, additional_tools, expected_error",
         [
-            ([], [], InterpreterError("Forbidden access to module: builtins")),
-            (["builtins", "os"], ["__import__"], None),
+            ([], [], InterpreterError("Forbidden access to dunder attribute: __traceback__")),
+            (
+                ["builtins", "os"],
+                ["__import__"],
+                InterpreterError("Forbidden access to dunder attribute: __traceback__"),
+            ),
         ],
     )
     def test_vulnerability_builtins_via_traceback(
@@ -1888,8 +1960,19 @@ class TestLocalPythonExecutorSecurity:
     @pytest.mark.parametrize(
         "additional_authorized_imports, additional_tools, expected_error",
         [
-            ([], [], InterpreterError("Forbidden access to module: builtins")),
-            (["builtins", "os"], ["__import__"], None),
+            ([], [], InterpreterError("Forbidden access to dunder attribute: __base__")),
+            (["warnings"], [], InterpreterError("Forbidden access to dunder attribute: __base__")),
+            (
+                ["warnings", "builtins"],
+                [],
+                InterpreterError("Forbidden access to dunder attribute: __base__"),
+            ),
+            (["warnings", "builtins", "os"], [], InterpreterError("Forbidden access to dunder attribute: __base__")),
+            (
+                ["warnings", "builtins", "os"],
+                ["__import__"],
+                InterpreterError("Forbidden access to dunder attribute: __base__"),
+            ),
         ],
     )
     def test_vulnerability_builtins_via_class_catch_warnings(
@@ -1902,20 +1985,22 @@ class TestLocalPythonExecutorSecurity:
             from builtins import __import__
 
             executor.send_tools({"__import__": __import__})
-        with (
-            pytest.raises(type(expected_error), match=f".*{expected_error}")
-            if isinstance(expected_error, Exception)
-            else does_not_raise()
-        ):
+        if isinstance(expected_error, tuple):  # different error depending on patch status
+            expected_error = expected_error[patch_builtin_import_module]
+        if isinstance(expected_error, Exception):
+            expectation = pytest.raises(type(expected_error), match=f".*{expected_error}")
+        elif expected_error is None:
+            expectation = does_not_raise()
+        with expectation:
             executor(
                 dedent(
                     """
                     classes = {}.__class__.__base__.__subclasses__()
                     for cls in classes:
                         if cls.__name__ == "catch_warnings":
-                            builtins = cls()._module.__builtins__
-                            builtins_import = builtins["__import__"]
                             break
+                    builtins = cls()._module.__builtins__
+                    builtins_import = builtins["__import__"]
                     os_module = builtins_import('os')
                     os_module.system(":")
                     """
@@ -1925,7 +2010,10 @@ class TestLocalPythonExecutorSecurity:
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     @pytest.mark.parametrize(
         "additional_authorized_imports, expected_error",
-        [([], InterpreterError("Forbidden access to module: os")), (["os"], None)],
+        [
+            ([], InterpreterError("Forbidden access to dunder attribute: __base__")),
+            (["os"], InterpreterError("Forbidden access to dunder attribute: __base__")),
+        ],
     )
     def test_vulnerability_load_module_via_builtin_importer(self, additional_authorized_imports, expected_error):
         executor = LocalPythonExecutor(additional_authorized_imports)
@@ -1946,3 +2034,44 @@ class TestLocalPythonExecutorSecurity:
                     """
                 )
             )
+
+    def test_vulnerability_class_via_subclasses(self):
+        # Subclass: subprocess.Popen
+        executor = LocalPythonExecutor([])
+        code = dedent(
+            """
+            for cls in ().__class__.__base__.__subclasses__():
+                if 'Popen' in cls.__class__.__repr__(cls):
+                    break
+            cls(["sh", "-c", ":"]).wait()
+            """
+        )
+        with pytest.raises(InterpreterError, match="Forbidden access to dunder attribute: __base__"):
+            executor(code)
+
+        code = dedent(
+            """
+            [c for c in ().__class__.__base__.__subclasses__() if "Popen" in c.__class__.__repr__(c)][0](
+                ["sh", "-c", ":"]
+            ).wait()
+            """
+        )
+        with pytest.raises(InterpreterError, match="Forbidden access to dunder attribute: __base__"):
+            executor(code)
+
+    @pytest.mark.parametrize(
+        "code, dunder_attribute",
+        [("a = (); b = a.__class__", "__class__"), ("class A:\n    attr=1\nx = A()\nx_dict = x.__dict__", "__dict__")],
+    )
+    def test_vulnerability_via_dunder_access(self, code, dunder_attribute):
+        executor = LocalPythonExecutor([])
+        with pytest.raises(InterpreterError, match=f"Forbidden access to dunder attribute: {dunder_attribute}"):
+            executor(code)
+
+    def test_vulnerability_via_dunder_indirect_access(self):
+        executor = LocalPythonExecutor([])
+        code = "a = (); b = getattr(a, '__class__')"
+        with pytest.raises(
+            InterpreterError, match="It is not permitted to evaluate other functions than the provided"
+        ):
+            executor(code)
