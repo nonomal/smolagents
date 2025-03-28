@@ -24,7 +24,6 @@ import re
 from collections.abc import Mapping
 from functools import wraps
 from importlib import import_module
-from importlib.util import find_spec
 from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -113,19 +112,6 @@ BASE_PYTHON_TOOLS = {
     "type": type,
     "complex": complex,
 }
-
-DANGEROUS_MODULES = [
-    "builtins",
-    "io",
-    "multiprocessing",
-    "os",
-    "pathlib",
-    "pty",
-    "shutil",
-    "socket",
-    "subprocess",
-    "sys",
-]
 
 DANGEROUS_FUNCTIONS = [
     "builtins.compile",
@@ -238,25 +224,11 @@ def safer_eval(func: Callable):
         result = func(expression, state, static_tools, custom_tools, authorized_imports=authorized_imports)
         if "*" not in authorized_imports:
             if isinstance(result, ModuleType):
-                for module_name in DANGEROUS_MODULES:
-                    if (
-                        module_name not in authorized_imports
-                        and result.__name__ == module_name
-                        # builtins has no __file__ attribute
-                        and getattr(result, "__file__", "")
-                        == (getattr(import_module(module_name), "__file__", "") if find_spec(module_name) else "")
-                    ):
-                        raise InterpreterError(f"Forbidden access to module: {module_name}")
-            elif isinstance(result, dict) and result.get("__name__"):
-                for module_name in DANGEROUS_MODULES:
-                    if (
-                        module_name not in authorized_imports
-                        and result["__name__"] == module_name
-                        # builtins has no __file__ attribute
-                        and result.get("__file__", "")
-                        == (getattr(import_module(module_name), "__file__", "") if find_spec(module_name) else "")
-                    ):
-                        raise InterpreterError(f"Forbidden access to module: {module_name}")
+                if result.__name__ not in authorized_imports:
+                    raise InterpreterError(f"Forbidden access to module: {result.__name__}")
+            elif isinstance(result, dict) and result.get("__spec__"):
+                if result["__name__"] not in authorized_imports:
+                    raise InterpreterError(f"Forbidden access to module: {result['__name__']}")
             elif isinstance(result, (FunctionType, BuiltinFunctionType)):
                 for qualified_function_name in DANGEROUS_FUNCTIONS:
                     module_name, function_name = qualified_function_name.rsplit(".", 1)
@@ -269,6 +241,19 @@ def safer_eval(func: Callable):
         return result
 
     return _check_return
+
+
+def evaluate_attribute(
+    expression: ast.Attribute,
+    state: Dict[str, Any],
+    static_tools: Dict[str, Callable],
+    custom_tools: Dict[str, Callable],
+    authorized_imports: List[str],
+) -> Any:
+    if expression.attr.startswith("__") and expression.attr.endswith("__"):
+        raise InterpreterError(f"Forbidden access to dunder attribute: {expression.attr}")
+    value = evaluate_ast(expression.value, state, static_tools, custom_tools, authorized_imports)
+    return getattr(value, expression.attr)
 
 
 def evaluate_unaryop(
@@ -344,6 +329,8 @@ def create_function(
     custom_tools: Dict[str, Callable],
     authorized_imports: List[str],
 ) -> Callable:
+    source_code = ast.unparse(func_def)
+
     def new_func(*args: Any, **kwargs: Any) -> Any:
         func_state = state.copy()
         arg_names = [arg.arg for arg in func_def.args.args]
@@ -393,6 +380,11 @@ def create_function(
             return None
 
         return result
+
+    # Store original AST, source code, and name
+    new_func.__ast__ = func_def
+    new_func.__source__ = source_code
+    new_func.__name__ = func_def.name
 
     return new_func
 
@@ -1318,8 +1310,7 @@ def evaluate_ast(
         else:
             return evaluate_ast(expression.orelse, *common_params)
     elif isinstance(expression, ast.Attribute):
-        value = evaluate_ast(expression.value, *common_params)
-        return getattr(value, expression.attr)
+        return evaluate_attribute(expression, *common_params)
     elif isinstance(expression, ast.Slice):
         return slice(
             evaluate_ast(expression.lower, *common_params) if expression.lower is not None else None,
